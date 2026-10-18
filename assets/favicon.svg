@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- BEAK Breakout. Rounded square r=22% (112.64) like all BEAK app icons. #dd007a, white cylinder with two knocked-out stripe gaps -->
+  <rect width="512" height="512" rx="112.64" ry="112.64" fill="#dd007a"/>
+  <g transform="translate(256 256) scale(0.789062) translate(-256 -256)">
+    <path fill="#ffffff" fill-rule="evenodd" d="M45,76 A211,76 0 0 1 467,76 L467,436 A211,76 0 0 1 45,436 Z M45,141 A211,76 0 0 0 467,141 L467,178 A211,76 0 0 1 45,178 Z M45,288 A211,76 0 0 0 467,288 L467,326 A211,76 0 0 1 45,326 Z"/>
+  </g>
+</svg>
