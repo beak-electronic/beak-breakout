@@ -225,7 +225,7 @@ function launch(){
 
 function destructibleLeft(){ for (var i = 0; i < G.bricks.length; i++) if (G.bricks[i].alive) return true; return false; }
 
-function hitBrick(br, ball){
+function hitBrick(br, ball, noClear){
   if (!br.alive) return;
   if (br.type === "dark"){
     if (G.fx.big > 0){ br.alive = false; G.score += 30; }
@@ -239,7 +239,7 @@ function hitBrick(br, ball){
   } else if (br.type === "extra"){
     br.alive = false; G.score += 50; applyExtra(br.letter, ball);
   } else { br.alive = false; G.score += 10; }
-  if (G.phase === "play" && !destructibleLeft()) levelCleared();
+  if (!noClear && G.phase === "play" && !destructibleLeft()) levelCleared();
 }
 
 // all destructible bricks gone -> short "Level geschafft!" moment (0.9 s), then next level with ball on paddle
@@ -595,31 +595,28 @@ function drawTagline(c, text, cx, baseline, size, col, maxW){
   for (i = 0; i < text.length; i++){ ch = text[i]; if (ch !== " ") c.fillText(ch, x, baseline); x += (ch === " " ? word : c.measureText(ch).width) + track; }
 }
 
-// ---- laser pulse: first brick destroyed (dark: whole, pulse ends); after a light/pink one the pulse may
-// destroy one more light/pink brick; dark, obstacles, notches and the top wall stop it without damage
-function isOneHit(br){ return br.type === "light" || br.type === "extra" || br.type === "laser"; }
+// ---- laser pulse: destroys EVERY brick in its path (light, dark whole without split, pink B/E/A/K with
+// their effect, the laser block) until an obstacle, a notch wall or the top wall stops it (no damage there)
+function laserBlocker(x){
+  var stop = WALL_T + LW_T;
+  G.obstacles.concat(G.notches).forEach(function(R){ if (x >= R.x && x <= R.x + R.w && R.y + R.h <= PADDLE_Y && R.y + R.h > stop) stop = R.y + R.h; });
+  return stop;
+}
+function laserPath(x, stopY){
+  return G.bricks.filter(function(br){ return br.alive && x >= br.x && x <= br.x + br.w && br.y + br.h <= PADDLE_Y && br.y >= stopY - 0.5; })
+    .sort(function(a, b){ return (b.y + b.h) - (a.y + a.h); });
+}
 function fireLaser(){
   if (G.screen !== "game" || G.paused || G.phase !== "play" || !(G.fx.laser > 0)) return false;
-  var x = G.paddle.x, items = [], i;
-  for (i = 0; i < G.bricks.length; i++){ var br = G.bricks[i]; if (br.alive && x >= br.x && x <= br.x + br.w && br.y + br.h <= PADDLE_Y) items.push({r: br, brick: true}); }
-  G.obstacles.concat(G.notches).forEach(function(R){ if (x >= R.x && x <= R.x + R.w && R.y + R.h <= PADDLE_Y) items.push({r: R, brick: false}); });
-  items.sort(function(a, b){ return (b.r.y + b.r.h) - (a.r.y + a.r.h); });
-  var stopY = WALL_T + LW_T, hits = 0, killed = [];
-  for (i = 0; i < items.length; i++){
-    var it = items[i], R = it.r;
-    stopY = R.y + R.h;
-    if (!it.brick) break;
-    if (hits === 0){
-      if (R.type === "dark"){ R.alive = false; G.score += 30; killed.push(R); afterLaserHit(); stopY = R.y; break; }
-      killed.push(R); hitBrick(R, null); hits = 1; stopY = R.y; continue;
-    }
-    if (isOneHit(R)){ killed.push(R); hitBrick(R, null); stopY = R.y; }
-    break;
-  }
-  if (i >= items.length) stopY = WALL_T + LW_T;
-  G.fx.laser--;
+  var x = G.paddle.x, stopY = laserBlocker(x), killed = laserPath(x, stopY);
+  G.fx.laser--;   // before the hits, so a pierced laser block refills to 3
+  killed.forEach(function(R){
+    if (R.type === "dark"){ R.alive = false; G.score += 30; }
+    else hitBrick(R, null, true);
+  });
   G.pulse = {x: x, y0: PADDLE_Y - 1, y1: stopY, t: PULSE_T, hits: killed.map(function(b){ return b.y + b.h; })};
   pulseFX(x, stopY, killed);
+  afterLaserHit();
   return true;
 }
 function afterLaserHit(){ if (G.phase === "play" && !destructibleLeft()) levelCleared(); }
@@ -639,6 +636,11 @@ function pulseFX(x, y1, killed){
   }
   // shattered bricks: a few fragments each
   killed.forEach(function(br){
+    for (var si = 0; si < 7; si++){
+      var sa2 = Math.random() * Math.PI * 2, sp2 = 120 + Math.random() * 360;
+      G.parts.push({k: "spark", x: x + (Math.random() - 0.5) * 8, y: br.y + br.h / 2, vx: Math.cos(sa2) * sp2, vy: Math.sin(sa2) * sp2,
+        life: 0.18 + Math.random() * 0.2, t: 0, col: Math.random() < 0.4 ? "#ffffff" : RED_GLOW});
+    }
     var col = br.type === "dark" ? GREY : (br.type === "light" ? LIGHT : PINK), cols = 4, rows = 2;
     var fw = br.w / cols, fh = br.h / rows;
     for (var cx = 0; cx < cols; cx++) for (var cy = 0; cy < rows; cy++){
@@ -710,19 +712,17 @@ function drawPulse(c){
   c.globalAlpha = 1;
 }
 
-// y where an upward beam from (x, PADDLE_Y) is stopped by the first brick / obstacle / wall / notch
-function beamStopY(x){
-  var stop = WALL_T + LW_T, i, R;
-  function test(R){ if (x >= R.x && x <= R.x + R.w && R.y + R.h <= PADDLE_Y && R.y + R.h > stop) stop = R.y + R.h; }
-  for (i = 0; i < G.bricks.length; i++) if (G.bricks[i].alive) test(G.bricks[i]);
-  G.obstacles.forEach(test); G.notches.forEach(test);
-  return stop;
-}
+// aiming beam: passes through bricks up to the first obstacle / notch wall / top wall; bricks in its path glow faintly
+function beamStopY(x){ return laserBlocker(x); }
 function drawLaserBeam(c){
   drawPulse(c);
   if (!(G.fx.laser > 0) || G.screen !== "game" || G.phase === "clear") return;
-  var x = G.paddle.x, y0 = PADDLE_Y - 1, y1 = beamStopY(x);
+  var x = G.paddle.x, y0 = PADDLE_Y - 1, y1 = beamStopY(x), path = laserPath(x, y1);
   c.save();
+  path.forEach(function(br){
+    rr(c, br.x, br.y, br.w, br.h, BR); c.globalAlpha = 0.16; c.fillStyle = RED; c.fill();
+    c.globalAlpha = 0.45; c.lineWidth = 1.2; c.strokeStyle = RED; c.stroke();
+  });
   c.strokeStyle = RED; c.globalAlpha = 0.18; c.lineWidth = 5; c.beginPath(); c.moveTo(x, y0); c.lineTo(x, y1); c.stroke();
   c.globalAlpha = 0.85; c.lineWidth = 1.6; c.beginPath(); c.moveTo(x, y0); c.lineTo(x, y1); c.stroke();
   c.globalAlpha = 1; c.fillStyle = RED; c.beginPath(); c.arc(x, y1 + 1, 2.4, 0, Math.PI * 2); c.fill();
@@ -1008,6 +1008,7 @@ window.BEAK = {G: G, LEVELS: LEVELS, startGame: function(n){ startGame((n || 1) 
   freeze: function(on){ G.frozen = !!on; }, advance: function(ms){ var rem = ms / 1000; while (rem > 1e-9){ var d = Math.min(STEP, rem); update(d); rem -= d; } render(); }, applyExtra: applyExtra, endGame: endGame, hitBrick: hitBrick, LAY: LAY, view: function(){ return view; }, resize: resize,
   // css-pixel rect of a menu button / the pause button (for tests)
   buttonRect: function(label){ for (var i = 0; i < G.buttons.length; i++){ var b = G.buttons[i]; if (b.label === label){ var a = menuToLogical(b.x, b.y), m = G.menuT.m; return {x: view.ox + a.x * view.scale, y: view.oy + a.y * view.scale, w: b.w * m * view.scale, h: b.h * m * view.scale}; } } return null; },
+  beamStopY: function(x){ return beamStopY(x); }, laserPath: function(x){ return laserPath(x, beamStopY(x)).length; },
   pauseRect: function(){ var P = LAY.pause; return {x: view.ox + P.x * view.scale, y: view.oy + P.y * view.scale, r: P.r * view.scale}; }};
 })();
 
