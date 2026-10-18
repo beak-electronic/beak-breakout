@@ -8,6 +8,9 @@ Kleines Breakout-Spiel im Browser – eine einzige, eigenständige HTML-Datei (`
 - ← → : Schläger bewegen
 - Leertaste (oder ↑): Ball starten
 - P / Esc: Pause
+- Leertaste im Spiel: Laser (nach Treffer auf „pure energy“, 3 Schuss)
+
+**iPhone / iPad:** Finger ziehen bewegt den Schläger, Tippen startet den Ball bzw. feuert den Laser, Pause-Knopf oben rechts. Auch als Home-Bildschirm-App nutzbar.
 
 ## Extras
 - **B** – großer Ball (10 s), zerstört dunkle Steine mit einem Treffer
