@@ -45,7 +45,7 @@ canvas#game{position:fixed;left:0;top:0;width:100%;height:100%;display:block;out
 <body>
 <canvas id="game" tabindex="0"></canvas>
 <div id="safe" aria-hidden="true"></div>
-<input id="bk-spx-7q3" name="bk-spielerkennung-x" type="text" inputmode="text" maxlength="18" autocomplete="nope" autocorrect="off" autocapitalize="off" spellcheck="false" enterkeyhint="go" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" aria-label="Spieler" placeholder="spieler">
+<input id="bk-spx-7q3" name="bk-spielerkennung-x" type="text" inputmode="text" maxlength="18" autocomplete="nope" autocorrect="off" autocapitalize="words" spellcheck="false" enterkeyhint="go" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" aria-label="Spieler" placeholder="spieler">
 <script>
 (function(){
 "use strict";
@@ -76,6 +76,74 @@ function lsGet(k, d){ try { var v = window.localStorage.getItem(k); return v ===
 function lsSet(k, v){ try { window.localStorage.setItem(k, v); } catch(e){} }
 function loadHS(){ try { var a = JSON.parse(lsGet(LS_HS, "[]")); return Array.isArray(a) ? a.filter(function(e){ return e && typeof e.score === "number"; }) : []; } catch(e){ return []; } }
 function saveHS(a){ lsSet(LS_HS, JSON.stringify(a)); }
+
+// ---------------------------------------------------------------- online highscores (Supabase PostgREST, anon: select + insert only)
+// Never blocks gameplay: 5 s timeout, silent fallback to the local list ("bestenliste offline").
+// Automated browsers (navigator.webdriver, i.e. the Playwright test suites) never contact the live list unless the
+// URL has ?hsonline=1 - highscore-test.js does that with the endpoint mocked, so tests never write to the live DB.
+var HS_URL = "https://chszumqahuvcdtcxstbc.supabase.co/rest/v1/scores";
+var HS_KEY = "sb_publishable_A9-EkhhMYMeZRU5T0ukXfg_KHTBSasd";   // public publishable key (browser-safe)
+var LS_OHS = "beak-breakout.v1.online";
+var HS_ON = !!window.fetch && (!navigator.webdriver || /[?&]hsonline=1\b/.test(location.search));
+var HS_TIMEOUT = 5000;
+function hsClean(s){ return String(s == null ? "" : s).replace(/[\u0000-\u001f\u007f-\u009f]/g, "").replace(/\s+/g, " ").trim().slice(0, 20); }
+function hsRow(r){
+  if (!r || typeof r.score !== "number" || typeof r.name !== "string") return null;
+  return {id: r.id, name: hsClean(r.name) || "Spieler", score: Math.max(0, Math.round(r.score)), level: Math.max(1, Math.min(10, (r.level | 0) || 1))};
+}
+function loadOHS(){ try { var a = JSON.parse(lsGet(LS_OHS, "null")); return Array.isArray(a) ? a.map(hsRow).filter(Boolean).slice(0, 10) : null; } catch(e){ return null; } }
+var OHS = {rows: loadOHS(), state: "idle", at: -1e9, myId: null, myRank: 0, gameNo: 0, submitted: -1, sending: false};
+function hsFetch(method, query, body, headers){
+  if (!HS_ON) return Promise.reject(new Error("off"));
+  var h = {apikey: HS_KEY, Authorization: "Bearer " + HS_KEY};
+  for (var k in headers) h[k] = headers[k];
+  var ctl = window.AbortController ? new AbortController() : null, timer = null;
+  var req = fetch(HS_URL + query, {method: method, headers: h, body: body ? JSON.stringify(body) : undefined, cache: "no-store", signal: ctl ? ctl.signal : undefined})
+    .then(function(r){
+      if (!r.ok) throw new Error("http " + r.status);
+      var range = r.headers.get("content-range");
+      return r.text().then(function(t){ return {data: t ? JSON.parse(t) : null, range: range}; });
+    });
+  var to = new Promise(function(_, rej){ timer = setTimeout(function(){ try { if (ctl) ctl.abort(); } catch(e){} rej(new Error("timeout")); }, HS_TIMEOUT); });
+  return Promise.race([req, to]).then(function(v){ clearTimeout(timer); return v; }, function(e){ clearTimeout(timer); throw e; });
+}
+function hsRefresh(force){
+  if (!HS_ON || OHS.state === "loading") return;
+  if (!force && performance.now() - OHS.at < 20000) return;   // throttle: at most every 20 s unless forced
+  OHS.state = "loading";
+  hsFetch("GET", "?select=id,name,score,level&order=score.desc,created_at.asc&limit=10").then(function(r){
+    if (!Array.isArray(r.data)) throw new Error("bad data");
+    OHS.rows = r.data.map(hsRow).filter(Boolean).slice(0, 10);
+    OHS.state = "ok"; OHS.at = performance.now(); lsSet(LS_OHS, JSON.stringify(OHS.rows));
+  }).catch(function(){ OHS.state = "offline"; OHS.at = performance.now(); });
+}
+// once per game (game over or win), only for score > 0; then the player's rank and a fresh top 10
+function hsSubmit(){
+  if (!HS_ON || G.score <= 0 || OHS.submitted === OHS.gameNo) return;
+  OHS.submitted = OHS.gameNo; OHS.myId = null; OHS.myRank = 0; OHS.sending = true;
+  var row = {name: hsClean(G.name) || "Spieler", score: Math.min(10000000, Math.max(0, Math.round(G.score))), level: Math.max(1, Math.min(10, G.level + 1))};
+  var game = OHS.gameNo;
+  hsFetch("POST", "?select=id", row, {"Content-Type": "application/json", Prefer: "return=representation"}).then(function(r){
+    var d = Array.isArray(r.data) ? r.data[0] : r.data;
+    if (game !== OHS.gameNo) return;
+    OHS.myId = d && d.id != null ? d.id : null;
+    OHS.state = "idle"; hsRefresh(true);
+    return hsFetch("GET", "?select=id&score=gt." + row.score, null, {Prefer: "count=exact", Range: "0-0"}).then(function(c){
+      var m = /\/(\d+)$/.exec(c.range || ""); if (m && game === OHS.gameNo) OHS.myRank = +m[1] + 1;
+    });
+  }).catch(function(){ if (game === OHS.gameNo){ OHS.state = "offline"; OHS.at = performance.now(); } })
+    .then(function(){ OHS.sending = false; });
+}
+// what the menus show: the online top 10 when available, else the local list (+ note when offline)
+function hsView(){
+  var online = HS_ON && OHS.rows && OHS.state !== "offline";
+  if (online){
+    var hl = -1; for (var i = 0; i < OHS.rows.length; i++) if (OHS.myId != null && OHS.rows[i].id === OHS.myId) hl = i;
+    return {rows: OHS.rows, online: true, hl: hl, note: OHS.rows.length || OHS.state !== "loading" ? "" : "lädt …"};
+  }
+  return {rows: G.hs, online: false, hl: G.screen === "start" ? -1 : G.lastRank, note: HS_ON && OHS.state === "offline" ? "offline" : ""};
+}
+hsRefresh(true);
 
 // ---------------------------------------------------------------- canvas / scaling
 var canvas = document.getElementById("game");
@@ -244,7 +312,10 @@ function levelGeom(li){
   return {bricks: bricks, obstacles: obstacles, notches: notches};
 }
 
-function baseSpeed(){ return 540 + G.level * 22; }
+// rounds: after level 10 the game continues at level 1, every completed round makes all balls 25 % faster (compounding)
+var ROUND_MUL = 1.25;
+function roundMul(){ return Math.pow(ROUND_MUL, Math.max(1, G.round || 1) - 1); }
+function baseSpeed(){ return (540 + G.level * 22) * roundMul(); }
 function ballRadius(){ return G.fx.big > 0 ? R_BIG : (G.fx.small ? R_SMALL : R_NORMAL); }
 function ballSpeed(){ return baseSpeed() * (G.fx.big > 0 ? 0.85 : (G.fx.small ? 1.35 : 1)); }
 
@@ -266,12 +337,15 @@ function resetRound(){
   G.balls = [{x: 640, y: PADDLE_Y - R_NORMAL, vx: 0, vy: 0, stuck: true}];
   G.phase = "ready";
 }
-function startGame(li){
+function levelLabel(){ return "level " + pad2(G.level + 1) + ((G.round || 1) > 1 ? "  ·  runde " + G.round : ""); }
+function startGame(li, round){
+  G.round = Math.max(1, round | 0 || 1);
   G.score = 0; G.lives = 3; G.lastRank = -1; G.paused = false;
+  OHS.gameNo++; OHS.myId = null; OHS.myRank = 0;
   playSnd("los-gehts");   // once per new game (not per level / relaunch)
-  G.screen = "game"; showInput(false);
+  G.screen = "game"; showInput(false); ptrs = {}; dragId = null; G.keys = {};
   loadLevel(li || 0);
-  flashMsg("level " + pad2(G.level + 1), 2.2);
+  flashMsg(levelLabel(), 2.2);
 }
 function flashMsg(t, d){ G.msg = t; G.msgT = d; }
 
@@ -406,8 +480,11 @@ function update(dt){
   if (G.phase === "clear"){
     G.clearTimer -= dt;
     if (G.clearTimer <= 0){
-      if (G.level >= LEVELS.length - 1) endGame(true);
-      else { loadLevel(G.level + 1); flashMsg("level " + pad2(G.level + 1), 2.2); }
+      if (G.level >= LEVELS.length - 1){   // all 10 done -> next round from level 1, balls +25 %
+        G.round = (G.round || 1) + 1; loadLevel(0);
+        flashMsg("runde " + G.round + "  ·  ball ×" + roundMul().toFixed(2).replace(/0$/, "").replace(".", ","), 2.8);
+      }
+      else { loadLevel(G.level + 1); flashMsg(levelLabel(), 2.2); }
     }
     return;
   }
@@ -461,21 +538,34 @@ function endGame(won){
   G.screen = won ? "win" : "over";
   G.lastRank = -1; G.endAt = performance.now();
   if (G.score > 0){
-    var e = {name: G.name || "Spieler", score: G.score, level: G.level + 1, date: new Date().toISOString().slice(0, 10)};
+    var e = {name: G.name || "Spieler", score: G.score, level: G.level + 1, round: G.round || 1, date: new Date().toISOString().slice(0, 10)};
     G.hs.push(e);
     G.hs.sort(function(a, b){ return b.score - a.score; });
     G.hs = G.hs.slice(0, 10);
     G.lastRank = G.hs.indexOf(e);
     saveHS(G.hs);
-  }
+    hsSubmit();
+  } else hsRefresh(false);
 }
-function bestHS(){ var b = G.hs.length ? G.hs[0].score : 0; return Math.max(b, G.screen === "game" ? G.score : 0); }
+function bestHS(){   // online top score when available, else local
+  var v = hsView(), b = v.online && v.rows.length ? v.rows[0].score : (G.hs.length ? G.hs[0].score : 0);
+  return Math.max(b, G.screen === "game" ? G.score : 0);
+}
 
 // ---------------------------------------------------------------- input
 function showInput(on){
   nameInput.style.display = on ? "block" : "none";
-  if (on){ nameInput.value = G.name; placeInput(); setTimeout(function(){ try { nameInput.focus(); nameInput.select(); } catch(e){} }, 0); }
-  else nameInput.blur();
+  nameInput.style.pointerEvents = on ? "auto" : "none";
+  if (on){
+    nameInput.value = G.name; lastInputKey = ""; placeInput();
+    // touch devices: no programmatic focus/select-all (iOS would hold a keyboard-less focused field with a text
+    // selection); the player taps the field to edit or just taps "Los"
+    if (!G.touchUI) setTimeout(function(){ try { if (G.screen === "start"){ nameInput.focus(); nameInput.select(); } } catch(e){} }, 0);
+  } else {
+    try { nameInput.setSelectionRange(0, 0); } catch(e){}
+    try { var sel = window.getSelection && window.getSelection(); if (sel) sel.removeAllRanges(); } catch(e){}
+    nameInput.blur();
+  }
 }
 var INPUT_BOX = {x: 660, y: 412, w: 600, h: 66};
 // menu screens are designed in 1920x1080 units and drawn with a transform (centred, enlarged on small screens)
@@ -500,8 +590,17 @@ function placeInput(){
   nameInput.style.fontSize = Math.max(16, 44 * T.m * s) + "px";   // >= 16 px: iOS does not zoom on focus
   nameInput.style.borderBottomWidth = Math.max(1, 2 * T.m * s) + "px";
 }
+// first letter of the name upper-case (iOS keyboards also get autocapitalize="words"); rest stays as typed
+function capFirst(v){ var m = /^(\s*)(\S)/.exec(v); if (!m) return v; var u = m[2].toLocaleUpperCase("de-DE"); return u === m[2] || u.length !== 1 ? v : m[1] + u + v.slice(m[0].length); }
+nameInput.addEventListener("input", function(){
+  var v = nameInput.value, nv = capFirst(v);
+  if (nv === v) return;
+  var a = nameInput.selectionStart, b = nameInput.selectionEnd;
+  nameInput.value = nv;
+  try { nameInput.setSelectionRange(a, b); } catch(e){}
+});
 function confirmStart(){
-  var n = (nameInput.value || "").trim().slice(0, 18);
+  var n = capFirst((nameInput.value || "").trim().slice(0, 18));
   if (!n){ nameInput.focus(); flashMsg("bitte namen eingeben", 1.5); return; }
   G.name = n; lsSet(LS_NAME, n);
   startGame(0);
@@ -532,7 +631,7 @@ window.addEventListener("keydown", function(e){
   }
 });
 window.addEventListener("keyup", function(e){ G.keys[e.key] = false; });
-window.addEventListener("blur", function(){ G.keys = {}; if (G.screen === "game" && G.phase === "play") G.paused = true; });
+window.addEventListener("blur", function(){ ptrs = {}; dragId = null; G.keys = {}; if (G.screen === "game" && G.phase === "play") G.paused = true; });
 
 // ---------------------------------------------------------------- touch / pointer
 // drag anywhere: paddle follows the finger 1:1 (relative, clamped); a short touch without movement = tap
@@ -563,10 +662,15 @@ function onTap(cx, cy){
     startGame(0);
   }
 }
+// forget all tracked pointers (stale ids from a touch whose up/cancel never arrived, e.g. iOS home swipe / app switch)
+function resetPointers(){ ptrs = {}; dragId = null; G.keys = {}; }
 canvas.addEventListener("pointerdown", function(e){
   if (e.pointerType === "touch" || e.pointerType === "pen") G.touchUI = true;
   e.preventDefault();
-  if (G.screen !== "start" && document.activeElement === nameInput) nameInput.blur();
+  if (G.screen !== "start" && document.activeElement === nameInput) showInput(false);
+  // a primary pointer starts a new gesture: no other pointer of this type can still be down -> drop stale ones
+  if (e.isPrimary){ for (var id in ptrs) if (ptrs[id].type === e.pointerType) delete ptrs[id]; }
+  if (dragId !== null && !ptrs[dragId]) dragId = null;
   try { canvas.setPointerCapture(e.pointerId); } catch(_){}
   ptrs[e.pointerId] = {x0: e.clientX, y0: e.clientY, lx: e.clientX, t0: performance.now(), moved: false, type: e.pointerType};
   if (dragId === null) dragId = e.pointerId;
@@ -586,13 +690,25 @@ function endPtr(e, cancel){
 }
 canvas.addEventListener("pointerup", function(e){ e.preventDefault(); endPtr(e, false); }, {passive: false});
 canvas.addEventListener("pointercancel", function(e){ endPtr(e, true); });
+canvas.addEventListener("lostpointercapture", function(e){ endPtr(e, true); });
+window.addEventListener("pointerup", function(e){ if (e.target !== canvas) endPtr(e, true); });
+window.addEventListener("pointercancel", function(e){ endPtr(e, true); });
+document.addEventListener("touchcancel", function(){ resetPointers(); });
 canvas.addEventListener("contextmenu", function(e){ e.preventDefault(); });
 // no page scroll / pinch / double-tap zoom / rubber band (the name field still works)
 document.addEventListener("touchmove", function(e){ if (e.target !== nameInput) e.preventDefault(); }, {passive: false});
 document.addEventListener("touchstart", function(e){ if (e.touches.length > 1) e.preventDefault(); }, {passive: false});
 ["gesturestart", "gesturechange", "gestureend", "dblclick"].forEach(function(t){ document.addEventListener(t, function(e){ e.preventDefault(); }, {passive: false}); });
-document.addEventListener("visibilitychange", function(){ if (document.hidden && G.screen === "game" && G.phase === "play") G.paused = true; });
-window.addEventListener("pagehide", function(){ if (G.screen === "game" && G.phase === "play") G.paused = true; });
+document.addEventListener("visibilitychange", function(){ resetPointers(); if (document.hidden && G.screen === "game" && G.phase === "play") G.paused = true; });
+window.addEventListener("pagehide", function(){ resetPointers(); if (G.screen === "game" && G.phase === "play") G.paused = true; });
+// back/forward cache restore or tab resume: clean input state, fresh layout, name field only on the start screen
+window.addEventListener("pageshow", function(e){
+  resetPointers();
+  if (!e.persisted) return;
+  lastInputKey = ""; resize();
+  if (G.screen === "start") showInput(true); else showInput(false);
+  if (G.screen === "game" && G.phase === "play") G.paused = true;
+});
 
 // ---------------------------------------------------------------- rendering
 function drawLogo(cx, y, w){
@@ -854,6 +970,7 @@ function drawExtraChip(c, f, x, y, u){
   c.textAlign = "left"; c.fillStyle = WHITE; c.font = (20 * u) + "px NunitoLI"; textTop(c, f[1] + (f[2] ? "  " + f[2] : ""), x + 58 * u, y - 1 * u, 20 * u);
   return 58 * u + c.measureText(f[1] + (f[2] ? "  " + f[2] : "")).width;
 }
+var CREDIT = "Soundeffekte: Ava (2)";
 function hintLines(){
   return G.touchUI ? ["ziehen: bewegen", "tippen: start / laser"] : ["← → bewegen · leertaste starten", "p / esc pause"];
 }
@@ -878,14 +995,22 @@ function drawHUD(){
   c.textAlign = "left";
   // vertical gap shrinks on small screens (large u) so the column always fits above the hints
   var fixedH = (282 + 56 + (G.fx.laser > 0 ? 64 : 0) + 26) * u;
-  var gw = G.fx.laser > 0 ? 6 : 5.22, g = ((y1 - 62 * u) - y - fixedH) / gw;
+  var y1h = y1 - 24 * u;   // hints sit one line higher to make room for the credit line
+  var gw = G.fx.laser > 0 ? 6 : 5.22, g = ((y1h - 62 * u) - y - fixedH) / gw;
   g = Math.max(8 * u, Math.min(36 * u, g));
   function item(label, value, font, size){
     c.font = (20 * u) + "px NunitoLI"; textTop(c, label, hx, y, 20 * u); y += 30 * u;
     c.font = (size * u) + "px " + font; textTop(c, fitText(c, value, maxW), hx, y, size * u); y += size * u + g;
   }
   item("spieler", G.name || "Spieler", "NunitoSB", 30);
+  var lvY = y + 30 * u;
   item("level", pad2(G.level + 1), "NunitoSB", 44);
+  if ((G.round || 1) > 1){
+    c.font = (44 * u) + "px NunitoSB"; var lw0 = c.measureText(pad2(G.level + 1)).width;
+    c.font = (18 * u) + "px NunitoLI"; c.globalAlpha = 0.85;
+    textTop(c, fitText(c, "runde " + G.round + " · ×" + roundMul().toFixed(2).replace(/0$/, "").replace(".", ","), maxW - lw0 - 14 * u), hx + lw0 + 14 * u, lvY + 20 * u, 18 * u);
+    c.globalAlpha = 1;
+  }
   item("score", fmt(G.score), "NunitoSB", 44);
   item("highscore", fmt(bestHS()), "NunitoSB", 44);
   c.font = (20 * u) + "px NunitoLI"; textTop(c, "leben", hx, y, 20 * u); y += 34 * u;
@@ -897,12 +1022,14 @@ function drawHUD(){
     y += 4 * u;
   }
   y += 26 * u + g * 1.22;
-  var fx = extrasList(), hints = hintLines(), hintTop = y1 - (28 + 24) * u;
+  var fx = extrasList(), hints = hintLines(), hintTop = y1h - (28 + 24) * u;
   if (fx.length && y + 34 * u + 38 * u <= hintTop){ c.font = (20 * u) + "px NunitoLI"; c.fillStyle = WHITE; textTop(c, "extras", hx, y, 20 * u); y += 34 * u; }
   fx.forEach(function(f){ if (y + 30 * u > hintTop) return; drawExtraChip(c, f, hx, y, u); y += 38 * u; });
   c.fillStyle = WHITE; c.font = (16 * u) + "px NunitoLI"; c.globalAlpha = 0.75; c.textAlign = "left";
-  textTop(c, fitText(c, hints[0], maxW), hx, y1 - 52 * u, 16 * u);
-  textTop(c, fitText(c, hints[1], maxW), hx, y1 - 28 * u, 16 * u);
+  textTop(c, fitText(c, hints[0], maxW), hx, y1h - 52 * u, 16 * u);
+  textTop(c, fitText(c, hints[1], maxW), hx, y1h - 28 * u, 16 * u);
+  textTop(c, fitText(c, CREDIT, maxW), hx, y1 - 28 * u, 16 * u);
+  G.creditBox = {x: hx, y: y1 - 28 * u, w: Math.min(maxW, c.measureText(CREDIT).width), h: 16 * u};
   c.globalAlpha = 1;
 }
 
@@ -912,10 +1039,20 @@ function drawHUDPortrait(){
   c.fillStyle = WHITE; c.fillRect(20, y - 14, 1040, 2);
   var cols = [["spieler", G.name || "Spieler", 30], ["level", pad2(G.level + 1), 40], ["score", fmt(G.score), 40], ["highscore", fmt(bestHS()), 40], ["leben", null, 0]];
   c.textAlign = "left";
+  if ((G.round || 1) > 1){   // small round tag next to the level number
+    c.font = (40 * u) + "px NunitoSB"; var lw1 = c.measureText(pad2(G.level + 1)).width;
+    c.fillStyle = WHITE; c.font = (18 * u) + "px NunitoLI"; c.globalAlpha = 0.85; c.textAlign = "left";
+    textTop(c, fitText(c, "runde " + G.round, colW - 20 - lw1), x0 + colW + 6 + lw1 + 8, y + 28 * u + 18 * u, 18 * u);
+    c.globalAlpha = 1;
+  }
   cols.forEach(function(col, i){
     var x = x0 + i * colW + 6;
     c.fillStyle = WHITE; c.font = (20 * u) + "px NunitoLI"; textTop(c, col[0], x, y, 20 * u);
-    if (col[1] !== null){ c.font = (col[2] * u) + "px NunitoSB"; textTop(c, fitText(c, col[1], colW - 14), x, y + 28 * u, col[2] * u); }
+    if (col[1] !== null){
+      var fs = col[2] * u; c.font = fs + "px NunitoSB";
+      if (i > 0){ var tw = c.measureText(col[1]).width; if (tw > colW - 14){ fs = Math.max(fs * 0.6, fs * (colW - 14) / tw); c.font = fs + "px NunitoSB"; } }   // numbers shrink, never ellipsize
+      textTop(c, fitText(c, col[1], colW - 14), x, y + 28 * u + (col[2] * u - fs) * 0.7, fs);
+    }
     else for (var k = 0; k < Math.max(0, G.lives); k++){ c.beginPath(); c.arc(x + 10 * u + k * 28 * u, y + 28 * u + 22 * u, 10 * u, 0, Math.PI * 2); c.fill(); }
   });
   var y2 = y + 110 * u, x = 26;
@@ -926,22 +1063,28 @@ function drawHUDPortrait(){
   extrasList().forEach(function(f){ if (x > 1000) return; x += drawExtraChip(c, f, x, y2 - 2 * u, u) + 26; });
   var hints = hintLines();
   c.fillStyle = WHITE; c.globalAlpha = 0.8; c.font = (22 * u) + "px NunitoLI"; c.textAlign = "center";
-  textTop(c, hints[0] + "  ·  " + hints[1], 540, y2 + 64 * u, 22 * u);
+  textTop(c, fitText(c, hints[0] + "  ·  " + hints[1], 1040), 540, y2 + 64 * u, 22 * u);
+  c.globalAlpha = 0.7; c.font = (18 * u) + "px NunitoLI";
+  textTop(c, CREDIT, 540, y2 + 98 * u, 18 * u);
+  var cw = c.measureText(CREDIT).width; G.creditBox = {x: 540 - cw / 2, y: y2 + 98 * u, w: cw, h: 18 * u};
   c.globalAlpha = 1; c.textAlign = "left";
 }
 
 function drawHSList(cx, y, highlight, rows){
-  var c = ctx;
+  var c = ctx, v = hsView(), list = v.rows;
+  if (highlight === undefined || highlight === null) highlight = v.hl;
   c.textBaseline = "alphabetic";
-  c.fillStyle = WHITE; c.font = "24px NunitoLI"; c.textAlign = "center"; c.fillText("highscores", cx, y); y += 20;
-  if (!G.hs.length){ c.font = "22px NunitoLI"; c.globalAlpha = 0.75; c.fillText("noch keine einträge", cx, y + 30); c.globalAlpha = 1; return; }
-  var n = Math.min(rows || 10, G.hs.length);
+  c.fillStyle = WHITE; c.font = "24px NunitoLI"; c.textAlign = "center";
+  c.fillText(v.online || v.note ? "bestenliste" + (v.note ? "  ·  " + v.note : "") : "highscores", cx, y); y += 20;
+  if (!list.length){ c.font = "22px NunitoLI"; c.globalAlpha = 0.75; c.fillText(v.note === "lädt …" ? "wird geladen …" : "noch keine einträge", cx, y + 30); c.globalAlpha = 1; return; }
+  var n = Math.min(rows || 10, list.length);
   for (var i = 0; i < n; i++){
-    var e = G.hs[i], ry = y + 10 + i * 34;
-    if (i === highlight){ rr(c, cx - 250, ry, 500, 32, 16); c.fillStyle = WHITE; c.fill(); c.fillStyle = PINK; } else c.fillStyle = WHITE;
-    c.font = "22px NunitoLI"; c.textAlign = "right"; c.fillText((i + 1) + ".", cx - 196, ry + 24);
-    c.font = "24px NunitoSB"; c.textAlign = "left"; c.fillText(fitText(c, e.name, 250), cx - 180, ry + 25);
-    c.textAlign = "right"; c.fillText(fmt(e.score), cx + 230, ry + 25);
+    var e = list[i], ry = y + 10 + i * 34;
+    if (i === highlight){ rr(c, cx - 290, ry, 580, 32, 16); c.fillStyle = WHITE; c.fill(); c.fillStyle = PINK; } else c.fillStyle = WHITE;
+    c.font = "22px NunitoLI"; c.textAlign = "right"; c.fillText((i + 1) + ".", cx - 236, ry + 24);
+    c.font = "24px NunitoSB"; c.textAlign = "left"; c.fillText(fitText(c, String(e.name), 270), cx - 220, ry + 25);   // canvas text: no markup interpretation
+    if (e.level){ c.font = "20px NunitoLI"; c.textAlign = "center"; c.globalAlpha = i === highlight ? 1 : 0.85; c.fillText("level " + pad2(e.level), cx + 112, ry + 24); c.globalAlpha = 1; }
+    c.font = "24px NunitoSB"; c.textAlign = "right"; c.fillText(fmt(e.score), cx + 272, ry + 25);
   }
   c.textAlign = "left";
 }
@@ -966,12 +1109,17 @@ function drawStart(){
   c.globalAlpha = 1;
   if (G.msgT > 0 && G.msg){ c.font = "22px NunitoSB"; c.fillText(G.msg, LW / 2, 636); }
   drawHSList(LW / 2, 676, -1, rows);
+  var nRows = Math.min(rows, hsView().rows.length || 1);
+  c.fillStyle = WHITE; c.textAlign = "center"; c.font = "18px NunitoLI"; c.globalAlpha = 0.7;
+  c.fillText(CREDIT, LW / 2, 676 + 30 + nRows * 34 + 46);   // small footer credit under the list
+  c.globalAlpha = 1; c.textAlign = "left";
+  hsRefresh(false);
 }
-function startBounds(){ var n = Math.min(startRows(), G.hs.length || 1); return [190, 676 + 30 + n * 34 + 10]; }
+function startBounds(){ var n = Math.min(startRows(), hsView().rows.length || 1); return [190, 676 + 30 + n * 34 + 56]; }
 
 function endRows(){ return (G.menuT && G.menuT.m > 1.15) || LAY.mode === "port" ? 5 : 10; }
 function endFooterY(){
-  var n = Math.min(endRows(), Math.max(1, G.hs.length));
+  var n = Math.min(endRows(), Math.max(1, hsView().rows.length));
   if (LAY.mode === "land" && (!G.menuT || G.menuT.m <= 1.0001)) return 1010;
   return 560 + 30 + n * 34 + 70;
 }
@@ -981,12 +1129,14 @@ function drawEnd(){
   drawLogo(959.5, 54, 433);
   c.textAlign = "center"; c.textBaseline = "alphabetic"; c.fillStyle = WHITE;
   c.font = "104px NunitoSB"; c.fillText(won ? "Geschafft!" : "Game Over", LW / 2, 270);
-  c.font = "26px NunitoLI"; c.fillText(won ? "alle 10 level gespielt, " + (G.name || "") : "level " + pad2(G.level + 1), LW / 2, 320);
+  c.font = "26px NunitoLI"; c.fillText(won ? "alle 10 level gespielt, " + (G.name || "") : levelLabel(), LW / 2, 320);
   c.font = "24px NunitoLI"; c.fillText("score", LW / 2, 380);
   c.font = "72px NunitoSB"; c.fillText(fmt(G.score), LW / 2, 452);
-  if (G.lastRank === 0){ c.font = "26px NunitoSB"; c.fillText("neuer highscore!", LW / 2, 494); }
-  else if (G.lastRank > 0){ c.font = "24px NunitoLI"; c.fillText("platz " + (G.lastRank + 1) + " in der bestenliste", LW / 2, 494); }
-  var rows = endRows(), hl = G.lastRank < rows ? G.lastRank : -1;
+  var hv = hsView(), rank = hv.online ? (OHS.myRank || (hv.hl >= 0 ? hv.hl + 1 : 0)) : G.lastRank + 1;
+  if (rank === 1){ c.font = "26px NunitoSB"; c.fillText("neuer highscore!", LW / 2, 494); }
+  else if (rank > 1){ c.font = "24px NunitoLI"; c.fillText("platz " + rank + " in der bestenliste", LW / 2, 494); }
+  else if (hv.online && OHS.sending){ c.font = "24px NunitoLI"; c.globalAlpha = 0.8; c.fillText("wird eingetragen …", LW / 2, 494); c.globalAlpha = 1; }
+  var rows = endRows(), hl = hv.hl < rows ? hv.hl : -1;
   drawHSList(LW / 2, 560, hl, rows);
   var fy = endFooterY();
   if (G.touchUI){
@@ -1045,7 +1195,7 @@ var lv = parseInt(params.get("level"), 10);
 function boot(){
   if (lv >= 1 && lv <= LEVELS.length){
     if (!G.name) G.name = params.get("name") || "Tester";
-    startGame(lv - 1);
+    startGame(lv - 1, parseInt(params.get("round"), 10) || 1);
   } else { G.screen = "start"; G.msgT = 0; showInput(true); }
   requestAnimationFrame(frame);
 }
@@ -1056,9 +1206,9 @@ var timeout = new Promise(function(res){ setTimeout(res, 800); });
 Promise.race([fontsReady, timeout]).then(boot);
 
 // test / debug hooks
-window.BEAK = {G: G, LEVELS: LEVELS, startGame: function(n){ startGame((n || 1) - 1); }, launch: launch,
+window.BEAK = {G: G, LEVELS: LEVELS, startGame: function(n, round){ startGame((n || 1) - 1, round); }, roundMul: roundMul, ballSpeed: function(){ return ballSpeed(); }, launch: launch,
   setAuto: function(on){ G.auto = !!on; }, setLaser: function(n){ G.fx.laser = n; }, fireLaser: fireLaser,
-  freeze: function(on){ G.frozen = !!on; }, advance: function(ms){ var rem = ms / 1000; while (rem > 1e-9){ var d = Math.min(STEP, rem); update(d); rem -= d; } render(); }, applyExtra: applyExtra, endGame: endGame, hitBrick: hitBrick, SND: SND, playSnd: playSnd, lossSound: lossSound, levelCleared: levelCleared, LAY: LAY, view: function(){ return view; }, resize: resize,
+  freeze: function(on){ G.frozen = !!on; }, advance: function(ms){ var rem = ms / 1000; while (rem > 1e-9){ var d = Math.min(STEP, rem); update(d); rem -= d; } render(); }, applyExtra: applyExtra, endGame: endGame, OHS: OHS, hsRefresh: hsRefresh, hsView: hsView, HS_ON: HS_ON, capFirst: capFirst, ptrState: function(){ return {n: Object.keys(ptrs).length, dragId: dragId}; }, CREDIT: CREDIT, creditBox: function(){ return G.creditBox; }, hitBrick: hitBrick, SND: SND, playSnd: playSnd, lossSound: lossSound, levelCleared: levelCleared, LAY: LAY, view: function(){ return view; }, resize: resize,
   // css-pixel rect of a menu button / the pause button (for tests)
   buttonRect: function(label){ for (var i = 0; i < G.buttons.length; i++){ var b = G.buttons[i]; if (b.label === label){ var a = menuToLogical(b.x, b.y), m = G.menuT.m; return {x: view.ox + a.x * view.scale, y: view.oy + a.y * view.scale, w: b.w * m * view.scale, h: b.h * m * view.scale}; } } return null; },
   beamStopY: function(x){ return beamStopY(x); }, laserPath: function(x){ return laserPath(x, beamStopY(x)).length; },
