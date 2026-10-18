@@ -24,17 +24,17 @@
 html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#dd007a;}
 body{user-select:none;-webkit-user-select:none;}
 canvas#game{position:fixed;left:0;top:0;width:100vw;height:100vh;display:block;outline:none;}
-#nameInput{position:fixed;display:none;box-sizing:border-box;background:transparent;border:none;
+#bk-spx-7q3{position:fixed;display:none;box-sizing:border-box;background:transparent;border:none;
   border-bottom:2px solid rgba(255,255,255,.9);color:#fff;font-family:"NunitoSB",sans-serif;text-align:center;
   outline:none;padding:0;margin:0;caret-color:#fff;border-radius:0;}
-#nameInput::placeholder{color:rgba(255,255,255,.55);font-family:"NunitoLI",sans-serif;}
-#nameInput::selection{background:rgba(255,255,255,.35);}
+#bk-spx-7q3::placeholder{color:rgba(255,255,255,.55);font-family:"NunitoLI",sans-serif;}
+#bk-spx-7q3::selection{background:rgba(255,255,255,.35);}
 
 </style>
 </head>
 <body>
 <canvas id="game" tabindex="0"></canvas>
-<input id="nameInput" type="text" maxlength="18" autocomplete="off" spellcheck="false" placeholder="name">
+<input id="bk-spx-7q3" name="bk-spielerkennung-x" type="text" inputmode="text" maxlength="18" autocomplete="nope" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" data-form-type="other" aria-label="Spieler" placeholder="spieler">
 <script>
 (function(){
 "use strict";
@@ -68,7 +68,7 @@ function saveHS(a){ lsSet(LS_HS, JSON.stringify(a)); }
 // ---------------------------------------------------------------- canvas / scaling
 var canvas = document.getElementById("game");
 var ctx = canvas.getContext("2d");
-var nameInput = document.getElementById("nameInput");
+var nameInput = document.getElementById("bk-spx-7q3");
 var view = {scale: 1, ox: 0, oy: 0, dpr: 1, cw: 0, ch: 0};
 function resize(){
   var dpr = window.devicePixelRatio || 1;
